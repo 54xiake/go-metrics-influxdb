@@ -21,8 +21,8 @@ This is only compatible with InfluxDB 0.9+.
 Usage
 -----
 
-```go
-import "github.com/jregovic/go-metrics-influxdb"
+```
+go import "github.com/jregovic/go-metrics-influxdb"
 
 go influxdb.InfluxDBWithTags(
     metrics.DefaultRegistry,    // metrics registry

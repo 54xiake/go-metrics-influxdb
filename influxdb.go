@@ -1,12 +1,13 @@
 package influxdb
 
 import (
+	"context"
 	"fmt"
 	"log"
 	uurl "net/url"
 	"time"
 
-	client "github.com/influxdata/influxdb1-client"
+	client "github.com/influxdata/influxdb-client-go/v2"
 	"github.com/rcrowley/go-metrics"
 )
 
@@ -15,23 +16,23 @@ type reporter struct {
 	interval time.Duration
 	align    bool
 	url      uurl.URL
-	database string
+	bucket   string
 
 	measurement string
-	username    string
-	password    string
+	org         string
+	token       string
 	tags        map[string]string
 
-	client *client.Client
+	client client.Client
 }
 
 // InfluxDB starts a InfluxDB reporter which will post the metrics from the given registry at each d interval.
-func InfluxDB(r metrics.Registry, d time.Duration, url, database, measurement, username, password string, align bool) {
-	InfluxDBWithTags(r, d, url, database, measurement, username, password, map[string]string{}, align)
+func InfluxDB(ctx context.Context, r metrics.Registry, d time.Duration, url, bucket, measurement, org, token string, align bool) {
+	InfluxDBWithTags(ctx, r, d, url, bucket, measurement, org, token, map[string]string{}, align)
 }
 
 // InfluxDBWithTags starts a InfluxDB reporter which will post the metrics from the given registry at each d interval with the specified tags
-func InfluxDBWithTags(r metrics.Registry, d time.Duration, url, database, measurement, username, password string, tags map[string]string, align bool) {
+func InfluxDBWithTags(ctx context.Context, r metrics.Registry, d time.Duration, url, bucket, measurement, org, token string, tags map[string]string, align bool) {
 	u, err := uurl.Parse(url)
 	if err != nil {
 		log.Printf("unable to parse InfluxDB url %s. err=%v", url, err)
@@ -42,32 +43,24 @@ func InfluxDBWithTags(r metrics.Registry, d time.Duration, url, database, measur
 		reg:         r,
 		interval:    d,
 		url:         *u,
-		database:    database,
+		bucket:      bucket,
 		measurement: measurement,
-		username:    username,
-		password:    password,
+		org:         org,
+		token:       token,
 		tags:        tags,
 		align:       align,
 	}
-	if err := rep.makeClient(); err != nil {
-		log.Printf("unable to make InfluxDB client. err=%v", err)
-		return
-	}
+	rep.makeClient()
 
-	rep.run()
+	rep.run(ctx)
 }
 
-func (r *reporter) makeClient() (err error) {
-	r.client, err = client.NewClient(client.Config{
-		URL:      r.url,
-		Username: r.username,
-		Password: r.password,
-	})
+func (r *reporter) makeClient() {
+	r.client = client.NewClient(r.url.String(), r.token)
 
-	return
 }
 
-func (r *reporter) run() {
+func (r *reporter) run(ctx context.Context) {
 	intervalTicker := time.Tick(r.interval)
 	pingTicker := time.Tick(time.Second * 5)
 
@@ -78,20 +71,17 @@ func (r *reporter) run() {
 				log.Printf("unable to send metrics to InfluxDB. err=%v", err)
 			}
 		case <-pingTicker:
-			_, _, err := r.client.Ping()
-			if err != nil {
+			isReady, err := r.client.Ready(ctx)
+			if err != nil || isReady == false {
 				log.Printf("got error while sending a ping to InfluxDB, trying to recreate client. err=%v", err)
-
-				if err = r.makeClient(); err != nil {
-					log.Printf("unable to make InfluxDB client. err=%v", err)
-				}
+				r.makeClient()
 			}
 		}
 	}
 }
 
 func (r *reporter) send() error {
-	var pts []client.Point
+	writeAPI := r.client.WriteAPI(r.org, r.bucket)
 
 	now := time.Now()
 	if r.align {
@@ -102,34 +92,31 @@ func (r *reporter) send() error {
 		switch metric := i.(type) {
 		case metrics.Counter:
 			ms := metric.Snapshot()
-			pts = append(pts, client.Point{
-				Measurement: r.measurement,
-				Tags:        r.tags,
-				Fields: map[string]interface{}{
+			p := client.NewPoint(r.measurement,
+				r.tags,
+				map[string]interface{}{
 					fmt.Sprintf("%s.count", name): ms.Count(),
 				},
-				Time: now,
-			})
+				now)
+			writeAPI.WritePoint(p)
 		case metrics.Gauge:
 			ms := metric.Snapshot()
-			pts = append(pts, client.Point{
-				Measurement: r.measurement,
-				Tags:        r.tags,
-				Fields: map[string]interface{}{
+			p := client.NewPoint(r.measurement,
+				r.tags,
+				map[string]interface{}{
 					fmt.Sprintf("%s.gauge", name): ms.Value(),
 				},
-				Time: now,
-			})
+				now)
+			writeAPI.WritePoint(p)
 		case metrics.GaugeFloat64:
 			ms := metric.Snapshot()
-			pts = append(pts, client.Point{
-				Measurement: r.measurement,
-				Tags:        r.tags,
-				Fields: map[string]interface{}{
+			p := client.NewPoint(r.measurement,
+				r.tags,
+				map[string]interface{}{
 					fmt.Sprintf("%s.gauge", name): ms.Value(),
 				},
-				Time: now,
-			})
+				now)
+			writeAPI.WritePoint(p)
 		case metrics.Histogram:
 			ms := metric.Snapshot()
 			ps := ms.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999, 0.9999})
@@ -148,15 +135,13 @@ func (r *reporter) send() error {
 				"p9999":    ps[5],
 			}
 			for k, v := range fields {
-				pts = append(pts, client.Point{
-					Measurement: r.measurement,
-					Tags:        bucketTags(k, r.tags),
-					Fields: map[string]interface{}{
+				p := client.NewPoint(r.measurement,
+					bucketTags(k, r.tags),
+					map[string]interface{}{
 						fmt.Sprintf("%s.histogram", name): v,
 					},
-					Time: now,
-				})
-
+					now)
+				writeAPI.WritePoint(p)
 			}
 		case metrics.Meter:
 			ms := metric.Snapshot()
@@ -168,14 +153,13 @@ func (r *reporter) send() error {
 				"mean":  ms.RateMean(),
 			}
 			for k, v := range fields {
-				pts = append(pts, client.Point{
-					Measurement: r.measurement,
-					Tags:        bucketTags(k, r.tags),
-					Fields: map[string]interface{}{
+				p := client.NewPoint(r.measurement,
+					bucketTags(k, r.tags),
+					map[string]interface{}{
 						fmt.Sprintf("%s.meter", name): v,
 					},
-					Time: now,
-				})
+					now)
+				writeAPI.WritePoint(p)
 			}
 
 		case metrics.Timer:
@@ -200,25 +184,18 @@ func (r *reporter) send() error {
 				"meanrate": ms.RateMean(),
 			}
 			for k, v := range fields {
-				pts = append(pts, client.Point{
-					Measurement: r.measurement,
-					Tags:        bucketTags(k, r.tags),
-					Fields: map[string]interface{}{
+				p := client.NewPoint(r.measurement,
+					bucketTags(k, r.tags),
+					map[string]interface{}{
 						fmt.Sprintf("%s.timer", name): v,
 					},
-					Time: now,
-				})
+					now)
+				writeAPI.WritePoint(p)
 			}
 		}
 	})
-
-	bps := client.BatchPoints{
-		Points:   pts,
-		Database: r.database,
-	}
-
-	_, err := r.client.Write(bps)
-	return err
+	writeAPI.Flush()
+	return nil
 }
 
 func bucketTags(bucket string, tags map[string]string) map[string]string {
